@@ -1,0 +1,340 @@
+import asyncio
+import aiohttp
+import aiosqlite
+from bs4 import BeautifulSoup
+# import random
+# import json
+
+# d18 [async][scenes][db_fetch][db_dump][no_proxy][ios_encoding][skip]
+#
+# use asyncio to speed up the data extraction process + limit the number of concurrent requests and urls to fetch + use ios_encoding as fallback if utf-8 encoding is not available
+# change in fetch function + removed proxies + added ios_encoding
+
+# Your fetch_proxies_from_geonode, fetch_proxies_from_api, fetch_proxies_from_github, and get_proxies functions here...
+
+print('Starting...')
+
+
+async def fetch(url, session):
+  try:
+    # Introduce a delay for rate limiting
+    await asyncio.sleep(0.5)  # Adjust the delay as needed
+    async with session.get(url, timeout=10) as response:
+      if response.status == 200:
+        print('Fetched:', url)
+        return await response.read(), response.content_type
+      else:
+        print(
+          f"Non-200 status encountered for {url}. Status: {response.status}")
+        return None, None
+  except Exception as e:
+    print(f"Error occurred while fetching {url}: {e}")
+    return None, None
+
+
+# Your update_scene_data, insert_tags, insert_scene_tags, and other helper functions here...
+
+
+async def update_scene_data(conn, url_id, url_title, image, duration,
+                            description, scene_number, episode_number,
+                            output_link, movie_name, movie_url,
+                            miniseries_name):
+  miniseries_id = None  # Assign a default value
+  if miniseries_name:  # Check if miniseries_name is not None or empty
+    async with conn.execute(
+        "SELECT id FROM Miniseries WHERE miniseries_name=?",
+      (miniseries_name, )) as cursor:
+      miniseries_row = await cursor.fetchone()
+      if not miniseries_row:
+        await conn.execute(
+          "INSERT OR IGNORE INTO Miniseries (miniseries_name) VALUES (?)",
+          (miniseries_name, ))
+        await conn.commit()
+        miniseries_id = cursor.lastrowid
+      else:
+        miniseries_id = miniseries_row[0]
+
+  await conn.execute(
+    "UPDATE Scenes SET page_title=?, thumbnail=?, duration=?, description=?, scene_number=?, episode_number=?, output_link=?, movie_title=?, movie_link=? WHERE id=?",
+    (url_title, image, duration, description, scene_number, episode_number,
+     output_link, movie_name, movie_url, url_id))
+  await conn.commit()
+
+  async with conn.execute("SELECT * FROM SceneMiniseries WHERE scene_id=?",
+                          (url_id, )) as cursor:
+    scene_miniseries_row = await cursor.fetchone()
+    if scene_miniseries_row:
+      # Update existing row
+      await conn.execute(
+        "UPDATE SceneMiniseries SET miniseries_id=? WHERE scene_id=?",
+        (miniseries_id, url_id))
+    elif miniseries_id is not None:  # Check if miniseries_id is not None
+      # Insert new row only if miniseries_id is not None
+      await conn.execute(
+        "INSERT OR IGNORE INTO SceneMiniseries (scene_id, miniseries_id) VALUES (?, ?)",
+        (url_id, miniseries_id))
+  await conn.commit()
+
+
+async def insert_tags(conn, tags):
+  async with conn.executemany(
+      "INSERT OR IGNORE INTO Tags (tag_name) VALUES (?)",
+    [(tag, ) for tag in tags]):
+    await conn.commit()
+
+
+async def insert_scene_tags(conn, url_id, tags):
+  async with conn.executemany(
+      "INSERT OR IGNORE INTO sceneTags (scene_id, tag_id) VALUES (?, (SELECT id FROM Tags WHERE tag_name=?))",
+    [(url_id, tag) for tag in tags]):
+    await conn.commit()
+
+
+# async def insert_miniseries(conn, miniseries_name):
+#   async with conn.execute(
+#       "INSERT OR IGNORE INTO Miniseries (miniseries_name) VALUES (?)",
+#     (miniseries_name, )):
+#     await conn.commit()
+
+
+async def url_has_thumbnail(conn, url_id):
+  async with conn.execute("SELECT thumbnail FROM Scenes WHERE id=?",
+                          (url_id, )) as cursor:
+    result = await cursor.fetchone()
+    print('scenes with no thumbnail are:', len(result), 'in total')
+    return result[0] if result else None
+
+
+##### DATA EXTRACTION ######
+
+
+async def extract_data(session, conn, url_id, url):
+  html, content_type = await fetch(url, session)
+  if html:
+    try:
+      # Attempt decoding with UTF-8
+      text = html.decode('utf-8')
+    except UnicodeDecodeError:
+      # If UTF-8 decoding fails, try decoding with ISO-8859-1
+      try:
+        text = html.decode('iso-8859-1')
+      except UnicodeDecodeError:
+        print(
+          f"Failed to decode {url} with both UTF-8 and ISO-8859-1 encoding")
+        return
+    # soup = BeautifulSoup(text, 'html.parser')
+    # Continue with your data extraction logic
+    soup = BeautifulSoup(html, 'html.parser')
+    # Data extraction logic goes here
+    url_title = soup.find('title').text
+    image = soup.find('img', id="playpriimage")['src']
+    duration = None
+    description = None
+    scene_number = None
+    episode_number = None
+    movie_name = None
+    movie_url = None
+    miniseries_name = None
+    tags = []
+    # Your data extraction logic goes here
+    # Your data extraction logic goes here
+    # Extracting output link
+    output_text = soup.find('div', id='moviewrap')
+    output_link = None  # Default value if output link is not found
+    if output_text:
+      output_link_tag = output_text.find('a')
+      if output_link_tag:
+        output_link = output_link_tag['href']
+    else:
+      print("Output text not found")
+
+    # Find the div containing scene information
+    scene_div = soup.find(
+      'div',
+      class_="gen12",
+      style="background: #F7F7F7; width: 624px; padding: 8px; margin-top: 0px;"
+    )
+
+    if scene_div:
+      # Extract duration if it exists in the alternative format
+      # Extract duration if it exists in the alternative format
+      dur_text = scene_div.find(
+        'p', style="padding: 0px; margin-left: 3px; margin-top: 8px;")
+      if scene_div:
+        # Extract duration if it exists in the alternative format
+        dur_text = scene_div.find(
+          'p', style="padding: 0px; margin-left: 3px; margin-top: 8px;")
+
+        # Check if duration is found directly
+        if dur_text:
+          duration_b_tag = dur_text.find('b')
+          if duration_b_tag:
+            duration = duration_b_tag.get_text(strip=True)
+          else:
+            print("Duration: Duration information not available")
+        else:
+          # Extract duration if it exists in the original format
+          # Extract scene information text
+          scene_info_text = scene_div.get_text(strip=True)
+
+          duration_start_index = scene_info_text.find("Duration:")
+          if duration_start_index != -1:
+            duration_end_index = scene_info_text.find("* Membership Site",
+                                                      duration_start_index)
+            duration = scene_info_text[duration_start_index +
+                                       len("Duration:"
+                                           ):duration_end_index].strip()
+            # Remove everything after and including the word "Studio"
+            studio_index = duration.find("Studio")
+            if studio_index != -1:
+              duration = duration[:studio_index].strip()
+          # Add condition to check for "Studio" text in duration
+          else:
+            porn_scene_info_div = scene_div.find(
+              'div', string="Porn Scene Information")
+            if porn_scene_info_div:
+              duration_info = porn_scene_info_div.find_next('b',
+                                                            string="Duration:")
+              print('Duration:', duration_info.text.strip())
+              if duration_info:
+                duration = duration_info.find_next('b').get_text(strip=True)
+                # Remove everything after and including the word "Studio"
+                studio_index = duration.find("Studio")
+                if studio_index != -1:
+                  duration = duration[:studio_index].strip()
+              else:
+                print("Duration: Duration information not available")
+      else:
+        print("Duration not found")
+
+      # Extract movie if it exists
+      # Extract movie info
+      movie_info = scene_div.find('b', string="Movie:")
+      if movie_info:
+        movie_link = movie_info.find_next('a')
+        if movie_link:
+          movie_name = movie_link.text.strip()
+          movie_url = movie_link['href']
+      else:
+        print("Movie: Movie information not available")
+
+      # Extracting the description
+      description = None
+
+      # Check if description exists with class="boxdesc"
+      desc_with_class = soup.find("div", class_="boxdesc")
+      if desc_with_class:
+        description = desc_with_class.text.replace('Story - ', '').strip()
+
+      # Check if description exists with specific styles
+      if not description:
+        descriptions = soup.find_all(
+          "div",
+          style=lambda s: s and
+          "margin-left: 3px; border-left: 2px solid #DCDCDC; padding: 6px; margin-top: 5px;"
+          in s)
+        if descriptions:
+          for desc_with_style in descriptions:
+            description = desc_with_style.text.replace('Story - ', '').strip()
+            break
+
+          if not description:
+            descriptions = soup.find_all(
+              "div",
+              style=lambda s: s and
+              "margin-left: 3px; border-left: 2px solid #DCDCDC; padding: 6px 6px 3px;"
+              in s)
+            if descriptions:
+              for desc_with_style in descriptions:
+                description = desc_with_style.text.replace('Story - ',
+                                                           '').strip()
+                break
+
+      # Extracting the miniseries name
+      miniseries_info = soup.find('b', string='Miniserie:')
+      if miniseries_info:
+        miniseries_name = miniseries_info.find_next_sibling(
+          'span', class_='listminiserie').text.strip()
+
+      # Extracting the episode number and total episodes
+      episode_info_div = soup.find(
+        'div', style='float: left; width: 120px; margin-left: 10px;')
+      if episode_info_div:
+        episode_info_text = episode_info_div.text.strip()
+        episode_number = episode_info_text.replace('Episode #', '').strip()
+
+      # Extracting scene information => number and total
+      scene_n_div = scene_div.find(
+        'div', style="float: left; width: 100px; margin-left: 7px;")
+      if scene_n_div:
+        scene_n = scene_n_div.text
+        scene_total = scene_n.replace('Scene #', '').strip()
+
+        # Extract the scene number
+        scene_number_text = scene_n_div.find('b').text
+        scene_number = scene_number_text.split('#')[-1].strip()
+
+      # Extract tags
+      categories_tag = scene_div.find('div', style="margin-top: 3px;")
+      if categories_tag:
+        tags_link = categories_tag.find_all('a')
+        tags = [tag.get_text(strip=True) for tag in tags_link]
+    # Once you have extracted all the required data, update it in the database
+    await update_scene_data(conn, url_id, url_title, image, duration,
+                            description, scene_number, episode_number,
+                            output_link, movie_name, movie_url,
+                            miniseries_name)
+    await insert_tags(conn, tags)
+    await insert_scene_tags(conn, url_id, tags)
+    # await insert_miniseries(conn, miniseries_name)
+    print("Processed URL:", url)
+  else:
+    print(f"Failed to fetch data from {url}")
+
+
+async def process_batch(session, conn, batch):
+  tasks = []
+  for url_id, url in batch:
+
+    tasks.append(extract_data(session, conn, url_id, url))
+  await asyncio.gather(*tasks)
+
+
+async def main():
+  # Your headers definition here...
+  headers = {
+    'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive',
+    'Cookie':
+    'data_user=MA-en-1; data_user_navigation=1; data_user_functions=0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-1-0-0-0-0-0-0-0-0-0; data_user_nav_pages=t%3D1%26b%3D7%26html%3Dindex; _ga_S3JKNGV0BY=GS1.1.1708086492.1.1.1708086530.0.0.0; _ga_JHZZQZ7GBL=GS1.1.1708086492.3.1.1708086530.0.0.0; data_user_nav_media_studio=3-350; data_user_nav_custom=t%3D1%26b%3D2%26html%3Dindex; data_user_functions=0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-1-0-0-0-0-0-0-0-0-0-0',
+    'Referer': 'https://www.data18.com/scenes',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+    'sec-ch-ua':
+    '"Not_A Brand";v="99", "Google Chrome";v="109", "Chromium";v="109"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"'
+  }  # Define your headers
+  batch_size = 100  # Adjust the batch size as needed
+  async with aiosqlite.connect('data18.db') as conn:
+    async with conn.cursor() as cursor:
+      await cursor.execute("SELECT id, url FROM Scenes WHERE thumbnail IS NULL"
+                           )
+      print('Scenes with no thumbnail fetched.')
+      urls = await cursor.fetchall()
+      print('scenes with no thumbnail are:', len(urls), 'in total')
+      async with aiohttp.ClientSession(headers=headers) as session:
+        for idx in range(0, len(urls), batch_size):
+          batch = urls[idx:idx + batch_size]
+
+          await process_batch(session, conn, batch)
+
+
+asyncio.run(main())
